@@ -1,0 +1,23 @@
+# Specify the Docker Compose file format version
+version: '3.8'
+
+# Define the services (containers) that make up your application
+services:
+  # The MongoDB database service
+  mongo:
+    # Use the official MongoDB image from Docker Hub
+    image: mongo:4.4
+    # Name the container
+    container_name: geot_tracking_db
+    # Forward the default MongoDB port
+    ports:
+      - "27017:27017"
+    # Define a volume to persist database data
+    # This ensures your data isn't lost when the container is stopped or removed
+    volumes:
+      - mongo-data:/data/db
+
+
+volumes:
+  mongo-data:
+  api:
