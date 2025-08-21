@@ -30,54 +30,54 @@ The application follows a decoupled, event-driven architecture.
 ### Data Flow Diagram
 
 ```mermaid
-sequenceDiagram
-    participant Client
-    participant FastAPI
-    participant OSRM
-    participant MongoDB
-    participant MovementSim as Movement Sim (Thread)
-    participant Redis
-    participant Listener as Listener (Thread)
-    participant WebSocket
+    sequenceDiagram
+        participant Client
+        participant FastAPI
+        participant OSRM
+        participant MongoDB
+        participant MovementSim as Movement Sim (Thread)
+        participant Redis
+        participant Listener as Listener (Thread)
+        participant WebSocket
 
-    Client->>+FastAPI: POST /packages (origin, dest)
-    FastAPI->>+MongoDB: Find nearby branches
-    MongoDB-->>-FastAPI: Branch data
-    FastAPI->>+OSRM: Get route with waypoints
-    OSRM-->>-FastAPI: Route coordinates
-    FastAPI->>+MongoDB: Create package document
-    MongoDB-->>-FastAPI: packageId
-    FastAPI-->>-Client: { "packageId": "PKG123" }
-    FastAPI-)-MovementSim: Start simulate_movement("PKG123")
+        Client->>+FastAPI: POST /packages (origin, dest)
+        FastAPI->>+MongoDB: Find nearby branches
+        MongoDB-->>-FastAPI: Branch data
+        FastAPI->>+OSRM: Get route with waypoints
+        OSRM-->>-FastAPI: Route coordinates
+        FastAPI->>+MongoDB: Create package document
+        MongoDB-->>-FastAPI: packageId
+        FastAPI->>MovementSim: Start simulate_movement("PKG123")
+        FastAPI-->>-Client: { "packageId": "PKG123" }
 
-    loop For each point in route
-        MovementSim->>+Redis: PUBLISH package_updates (location)
-        Redis-->>-MovementSim:
-        MovementSim->>MovementSim: sleep()
-    end
+        loop For each point in route
+            MovementSim->>+Redis: PUBLISH package_updates (location)
+            Redis-->>-MovementSim:
+            MovementSim->>MovementSim: sleep()
+        end
 
-    Listener->>+Redis: SUBSCRIBE package_updates
-    Note over Redis, Listener: Listener is always running
+        Listener->>+Redis: SUBSCRIBE package_updates
+        Note over Redis, Listener: Listener is always running
 
-    Redis-->>Listener: Receives location update
-    Listener->>+MongoDB: UPDATE package location
-    MongoDB-->>-Listener:
-    Listener->>+FastAPI: run_coroutine_threadsafe(send_to_clients)
-    FastAPI-->>-Listener:
+        Redis-->>Listener: Receives location update
+        Listener->>+MongoDB: UPDATE package location
+        MongoDB-->>-Listener:
+        Listener->>+FastAPI: run_coroutine_threadsafe(send_to_clients)
+        FastAPI-->>-Listener:
 
-    Client->>+FastAPI: GET /packages/PKG123/map
-    FastAPI->>+MongoDB: Get package data
-    MongoDB-->>-FastAPI:
-    FastAPI-->>-Client: HTML with Folium map & JS
+        Client->>+FastAPI: GET /packages/PKG123/map
+        FastAPI->>+MongoDB: Get package data
+        MongoDB-->>-FastAPI:
+        FastAPI-->>-Client: HTML with Folium map & JS
 
-    Client->>+WebSocket: Connect to /ws/PKG123
-    WebSocket-->>-Client: Connection accepted
+        Client->>+WebSocket: Connect to /ws/PKG123
+        WebSocket-->>-Client: Connection accepted
 
-    loop On location update received by Listener
-        FastAPI->>+WebSocket: PUSH location update
-        WebSocket-->>-Client: Receives JSON update
-        Note over Client: JS animates marker on map
-    end
+        loop On Redis message
+            FastAPI->>+WebSocket: PUSH location update
+            WebSocket-->>-Client: Receives JSON update
+            Note over Client: JS animates marker on map
+        end
 ```
 
 ## 🛠️ Tech Stack
