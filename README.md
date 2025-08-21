@@ -100,7 +100,7 @@ sequenceDiagram
 
 1.  **Clone the repository:**
     ```bash
-    git clone <your-repo-url>
+    git clone github.com:Amir-Hossein-shamsi/Real-Time-Geo-Tracking-Application.git
     cd geortacking-app
     ```
 
@@ -120,6 +120,8 @@ sequenceDiagram
     ```bash
     docker run -d -p 27017:27017 --name geo-mongo mongo:latest
     docker run -d -p 6379:6379 --name geo-redis redis:latest
+    # or use docker-compose.yml as like as me
+    # docker-compose up -d
     ```
 
 5.  **Populate the database with dummy branch data:**
