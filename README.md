@@ -73,7 +73,7 @@ sequenceDiagram
     Client->>+WebSocket: Connect to /ws/PKG123
     WebSocket-->>-Client: Connection accepted
 
-    loop On Redis message
+    loop On location update received by Listener
         FastAPI->>+WebSocket: PUSH location update
         WebSocket-->>-Client: Receives JSON update
         Note over Client: JS animates marker on map
@@ -189,4 +189,3 @@ sequenceDiagram
 3.  Copy the `packageId` from the response.
 4.  Open your web browser and navigate to `http://localhost:8000/packages/YOUR_PACKAGE_ID/map` (replace `YOUR_PACKAGE_ID` with the actual ID).
 5.  Watch the 🚚 icon move along the calculated route in real-time!
-
