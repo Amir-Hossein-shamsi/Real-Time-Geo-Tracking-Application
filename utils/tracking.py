@@ -87,6 +87,30 @@ def create_map_html(package_id, route_points, branches, current_location):
         """
     return html
 
+
+def remaining_route_distance(current_lat, current_lon, route_points):
+    """
+    Sum Haversine distances along the remaining route from current location.
+    """
+    if not route_points:
+        return 0.0
+
+    # Find closest point on route to current location
+    closest_idx = min(
+        range(len(route_points)),
+        key=lambda i: haversine_km((current_lat, current_lon), route_points[i])
+    )
+
+    # Distance from current location to first route point
+    dist = haversine_km((current_lat, current_lon), route_points[closest_idx])
+
+    # Sum distances along remaining route
+    for i in range(closest_idx, len(route_points)-1):
+        dist += haversine_km(route_points[i], route_points[i+1])
+
+    return dist
+
+
 #  ======= Redis Config=====
 
 import redis, json
@@ -120,6 +144,14 @@ def redis_listener(packages_col):
 import math
 
 # ==== Distance (Haversine) ====
+def haversine_km(a,b):
+    R=6371
+    from math import radians,sin,cos,atan2,sqrt
+    lat1,lon1,lat2,lon2=map(radians,[a[0],a[1],b[0],b[1]])
+    dlat=lat2-lat1; dlon=lon2-lon1
+    h=sin(dlat/2)**2+cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    return 2*R*atan2(sqrt(h), sqrt(1-h))
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371  # Earth radius in km
     dlat = math.radians(lat2 - lat1)
@@ -169,3 +201,59 @@ def get_nearest_branch(lat, lon, exclude_ids=[],branches_col=None):
     candidates = [b for b in branches if b['branchId'] not in exclude_ids]
     nearest = min(candidates, key=lambda b: haversine(lat, lon, b['lat'], b['lon']))
     return nearest
+
+# Kafka producer for movement events
+producer = None
+def get_kafka_producer():
+    global producer
+    if producer is None:
+        from kafka import KafkaProducer
+        producer = KafkaProducer(
+            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
+            value_serializer=lambda v: json.dumps(v).encode("utf-8")
+        )
+    return producer
+
+def haversine_km(a, b):
+    import math
+    (lat1, lon1), (lat2, lon2) = a, b
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    la1 = math.radians(lat1); la2 = math.radians(lat2)
+    h = (math.sin(dlat/2)**2 +
+         math.cos(la1) * math.cos(la2) * math.sin(dlon/2)**2)
+    return 2 * R * math.atan2(math.sqrt(h), math.sqrt(1-h))
+
+
+
+
+def simulate_movement_kafka(package_id: str, packages_col=None,snapshots_col=None):
+    producer = get_kafka_producer()
+    pkg = packages_col.find_one({"packageId": package_id})
+    if not pkg:
+        return
+
+    for lat, lon in pkg["route"]:
+        evt = {
+            "packageId": package_id,
+            "lat": float(lat),
+            "lon": float(lon),
+            "ts": int(time.time())
+        }
+
+        # send to Kafka
+        producer.send("package_updates", evt)
+        producer.flush(0.1)
+
+        # **update Redis** for real-time status
+        r.hset(
+            f"PKG:{package_id}",
+            mapping={"lat": evt["lat"], "lon": evt["lon"], "ts": evt["ts"]}
+        )
+
+        # **also store snapshot** (optional)
+        snapshots_col.insert_one(evt)
+
+        time.sleep(2)  # simulate movement every 2s
+

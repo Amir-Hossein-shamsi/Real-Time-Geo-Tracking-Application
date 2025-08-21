@@ -1,36 +1,98 @@
-# Specify the Docker Compose file format version
 version: '3.8'
 
-# Define the services (containers) that make up your application
 services:
-  # The MongoDB database service
+  # -------------------------
+  # MongoDB
+  # -------------------------
   mongo:
-    # Use the official MongoDB image from Docker Hub
     image: mongo:4.4
-    # Name the container
     container_name: geo_tracking_db
-    # Forward the default MongoDB port
     ports:
       - "27017:27017"
-    # Define a volume to persist database data
-    # This ensures your data isn't lost when the container is stopped or removed
     volumes:
       - mongo-data:/data/db
 
-  # The Redis service for caching and pub/sub
+  # -------------------------
+  # Redis
+  # -------------------------
   redis:
-    # Use a lightweight Redis image
     image: redis:6-alpine
-    # Name the container
     container_name: geo_tracking_redis
-    # Forward the default Redis port
     ports:
       - "6379:6379"
-    # Define a volume to persist Redis data
     volumes:
       - redis-data:/data
+
+  # -------------------------
+  # Zookeeper
+  # -------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: geo_tracking_zookeeper
+    restart: always
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  # -------------------------
+  # Kafka
+  # -------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: geo_tracking_kafka
+    restart: always
+    depends_on:
+      - zookeeper
+    ports:
+      # This port is for external connections from your host machine
+      - "9092:9092"
+      # This port is for internal connections between containers
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      # Defines listeners for internal (container-to-container) and external (host-to-container) traffic
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # -------------------------
+  # OSRM (Optional for ETA)
+  # -------------------------
+  osrm:
+    image: osrm/osrm-backend:latest
+    container_name: geo_tracking_osrm
+    command: osrm-routed --algorithm mld /data/tehran.osrm
+    volumes:
+      - ./osrm-data:/data
+    ports:
+      - "5000:5000"
+
+  # -------------------------
+  # FastAPI App
+  # -------------------------
+  api:
+    build: .
+    container_name: geo_tracking_api
+    restart: always
+    depends_on:
+      - mongo
+      - redis
+      - kafka
+    ports:
+      - "8000:8000"
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      REDIS_URL: redis://redis:6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      OSRM_URL: http://osrm:5000
 
 volumes:
   mongo-data:
   redis-data:
-  api:
+  kafka-data:

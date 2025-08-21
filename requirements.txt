@@ -4,3 +4,5 @@ pymongo
 redis
 folium
 requests
+kafka-python
+
