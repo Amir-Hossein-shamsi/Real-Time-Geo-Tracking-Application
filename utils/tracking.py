@@ -33,26 +33,89 @@ def create_map_html(package_id, route_points, branches, current_location):
             icon=folium.Icon(color="green", icon="building")
         ).add_to(m)
 
-    # Current location
-    folium.Marker(
+    # 🚚 Custom truck icon
+    truck_icon = folium.CustomIcon(
+        icon_image="./assets/package.png",
+        icon_size=(32, 32) 
+    )
+
+    # Initial marker (JS will update it)
+    truck_marker = folium.Marker(
         current_location,
         popup=f"Package {package_id}",
-        icon=folium.Icon(color="red", icon="truck")
-    ).add_to(m)
+        icon=truck_icon
+    )
+    truck_marker.add_to(m)
 
-    return m._repr_html_()  # Return HTML string instead of saving file
+    # Render map
+    html = m.get_root().render()
 
+    # Inject WebSocket + JS marker update
+    html += f"""
+        <script>
+            var ws = new WebSocket("ws://localhost:8000/ws/{package_id}");
+            var truckMarker = {truck_marker.get_name()};
 
+            // Helper for smooth movement
+            function animateMarker(marker, newLatLng, durationMs) {{
+                var start = marker.getLatLng();
+                var end = L.latLng(newLatLng[0], newLatLng[1]);
+                var startTime = null;
+
+                function step(timestamp) {{
+                    if (!startTime) startTime = timestamp;
+                    var progress = (timestamp - startTime) / durationMs;
+                    if (progress > 1) progress = 1;
+
+                    var lat = start.lat + (end.lat - start.lat) * progress;
+                    var lng = start.lng + (end.lng - start.lng) * progress;
+                    marker.setLatLng([lat, lng]);
+
+                    if (progress < 1) {{
+                        requestAnimationFrame(step);
+                    }}
+                }}
+                requestAnimationFrame(step);
+            }}
+
+            ws.onmessage = function(event) {{
+                var data = JSON.parse(event.data);
+                var loc = data.currentLocation;
+                animateMarker(truckMarker, [loc[0], loc[1]], 2000); // 2s smooth animation
+            }};
+        </script>
+        """
+    return html
+
+#  ======= Redis Config=====
+
+import redis, json
+r = redis.Redis(host="localhost", port=6379, db=0)
 
 # ==== Background Package Movement ====
 def simulate_movement(package_id, packages_col):
     pkg = packages_col.find_one({"packageId": package_id})
-    if not pkg: return
-    route = pkg["route"]
-    for point in route:
-        packages_col.update_one({"packageId": package_id}, {"$set": {"currentLocation": point}})
-        time.sleep(2)  # Simulate movement
+    if not pkg:
+        return
 
+    for point in pkg["route"]:
+        update = {"packageId": package_id, "currentLocation": point}
+        # Publish to Redis channel
+        r.publish("package_updates", json.dumps(update))
+        time.sleep(5)
+        
+        
+# ==== Subcribe(background task)==== 
+def redis_listener(packages_col):
+    pubsub = r.pubsub()
+    pubsub.subscribe("package_updates")
+    for message in pubsub.listen():
+        if message["type"] == "message":
+            data = json.loads(message["data"])
+            packages_col.update_one(
+                {"packageId": data["packageId"]},
+                {"$set": {"currentLocation": data["currentLocation"]}}
+            )
 
 import math
 

@@ -8,7 +8,7 @@ services:
     # Use the official MongoDB image from Docker Hub
     image: mongo:4.4
     # Name the container
-    container_name: geot_tracking_db
+    container_name: geo_tracking_db
     # Forward the default MongoDB port
     ports:
       - "27017:27017"
@@ -17,7 +17,20 @@ services:
     volumes:
       - mongo-data:/data/db
 
+  # The Redis service for caching and pub/sub
+  redis:
+    # Use a lightweight Redis image
+    image: redis:6-alpine
+    # Name the container
+    container_name: geo_tracking_redis
+    # Forward the default Redis port
+    ports:
+      - "6379:6379"
+    # Define a volume to persist Redis data
+    volumes:
+      - redis-data:/data
 
 volumes:
   mongo-data:
+  redis-data:
   api:
