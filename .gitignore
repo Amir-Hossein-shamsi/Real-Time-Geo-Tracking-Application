@@ -5,7 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
-
+.env
+.DS_Store
+.ipynb_checkpoints
 # Virtual environments
 .venv
 README-preVersion.md

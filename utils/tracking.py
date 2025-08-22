@@ -1,259 +1,198 @@
-from fastapi import FastAPI, HTTPException
-import requests, folium, time
-
 import os
-
-# ==== OSRM Routing ====
-def get_route(origin, destination, waypoints=[]):
-    base_url = "http://router.project-osrm.org/route/v1/driving/"
-    points = [f"{origin[1]},{origin[0]}"] + [f"{wp[1]},{wp[0]}" for wp in waypoints] + [f"{destination[1]},{destination[0]}"]
-    coords = ";".join(points)
-    url = f"{base_url}{coords}?overview=full&geometries=geojson"
-    r = requests.get(url)
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail="Routing API failed")
-    data = r.json()
-    route_coords = [(lat, lon) for lon, lat in data["routes"][0]["geometry"]["coordinates"]]
-    return route_coords
+import json
+import time
+from typing import List, Tuple, Optional
+import redis
+from kafka import KafkaProducer
+import requests
+from fastapi import HTTPException
+from pymongo.collection import Collection
+from utils.salesman_routing import traveller_salesman, haversine_km
 
 
 
-# ==== Folium Map ====
-def create_map_html(package_id, route_points, branches, current_location):
-    m = folium.Map(location=route_points[0], zoom_start=13)
+Coord = Tuple[float, float]  # (lat, lon)
 
-    # Route
-    folium.PolyLine(route_points, color="blue", weight=5).add_to(m)
+# -------- OSRM helpers --------
 
-    # Branch markers
-    for br in branches:
-        folium.Marker(
-            [br['lat'], br['lon']],
-            popup=br['name'],
-            icon=folium.Icon(color="green", icon="building")
-        ).add_to(m)
-
-    # 🚚 Custom truck icon
-    truck_icon = folium.CustomIcon(
-        icon_image="./assets/package.png",
-        icon_size=(32, 32) 
-    )
-
-    # Initial marker (JS will update it)
-    truck_marker = folium.Marker(
-        current_location,
-        popup=f"Package {package_id}",
-        icon=truck_icon
-    )
-    truck_marker.add_to(m)
-
-    # Render map
-    html = m.get_root().render()
-
-    # Inject WebSocket + JS marker update
-    html += f"""
-        <script>
-            var ws = new WebSocket("ws://localhost:8000/ws/{package_id}");
-            var truckMarker = {truck_marker.get_name()};
-
-            // Helper for smooth movement
-            function animateMarker(marker, newLatLng, durationMs) {{
-                var start = marker.getLatLng();
-                var end = L.latLng(newLatLng[0], newLatLng[1]);
-                var startTime = null;
-
-                function step(timestamp) {{
-                    if (!startTime) startTime = timestamp;
-                    var progress = (timestamp - startTime) / durationMs;
-                    if (progress > 1) progress = 1;
-
-                    var lat = start.lat + (end.lat - start.lat) * progress;
-                    var lng = start.lng + (end.lng - start.lng) * progress;
-                    marker.setLatLng([lat, lng]);
-
-                    if (progress < 1) {{
-                        requestAnimationFrame(step);
-                    }}
-                }}
-                requestAnimationFrame(step);
-            }}
-
-            ws.onmessage = function(event) {{
-                var data = JSON.parse(event.data);
-                var loc = data.currentLocation;
-                animateMarker(truckMarker, [loc[0], loc[1]], 2000); // 2s smooth animation
-            }};
-        </script>
-        """
-    return html
-
-
-def remaining_route_distance(current_lat, current_lon, route_points):
+def _osrm_url(points_ll: List[Coord]) -> str:
     """
-    Sum Haversine distances along the remaining route from current location.
+    Build OSRM route URL for a list of (lat, lon) points:
+    OSRM expects lon,lat order separated by ';'
+    """
+    base = "http://router.project-osrm.org/route/v1/driving/"
+    seq = ";".join([f"{lon},{lat}" for (lat, lon) in points_ll])
+    return f"{base}{seq}?overview=full&geometries=geojson"
+
+def get_route_segment(a: Coord, b: Coord, waypoints: Optional[List[Coord]] = None) -> List[Coord]:
+    """
+    Get polyline segment between a -> b (optionally via waypoints).
+    Returns list of (lat, lon).
+    """
+    points = [a] + (waypoints or []) + [b]
+    url = _osrm_url(points)
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Routing API failed ({r.status_code})")
+    data = r.json()
+    coords = data["routes"][0]["geometry"]["coordinates"]  # list of [lon, lat]
+    return [(lat, lon) for lon, lat in coords]
+
+def route_distance_km(a: Coord, b: Coord) -> float:
+    """
+    Driving distance (km) via OSRM between a and b.
+    """
+    url = _osrm_url([a, b])
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        # fall back to haversine rather than failing hard
+        return haversine_km(a, b)
+    data = r.json()
+    meters = float(data["routes"][0]["distance"])
+    return meters / 1000.0
+
+# -------- Trip classification & branch picking --------
+
+def classify_trip_km(direct_km: float) -> str:
+    if direct_km < 15:
+        return "inner_city"
+    elif direct_km < 50:
+        return "medium_trip"
+    return "inter_city"
+
+def build_branch_chain(
+    origin: Coord,
+    destination: Coord,
+    branches_col: Collection,
+    max_detour_km: float = 5.0
+) -> List[dict]:
+    """
+    Pick *useful* branches along the way, not all of them.
+    - inner city: 0 branches
+    - medium trip: ≤1 branch near path
+    - inter city: multiple branches if detour is small
+    """
+    direct_km = route_distance_km(origin, destination)
+    trip_type = classify_trip_km(direct_km)
+
+    if trip_type == "inner_city":
+        return []
+
+    selected = []
+    # only load what we need
+    for b in branches_col.find({}, {"_id": 0, "branchId": 1, "name": 1, "lat": 1, "lon": 1}):
+        branch = (float(b["lat"]), float(b["lon"]))
+
+        # distance via branch
+        via_km = route_distance_km(origin, branch) + route_distance_km(branch, destination)
+
+        if via_km <= direct_km + max_detour_km:
+            b["coords"] = branch
+            b["via_km"] = via_km
+            selected.append(b)
+
+    # order by proximity from origin along the path
+    selected.sort(key=lambda b: route_distance_km(origin, b["coords"]))
+
+    if trip_type == "medium_trip":
+        return selected[:1]
+    return selected
+
+# -------- Multi-stop route builder (origin → [branches...] → destination) --------
+
+def build_multi_stop_route(
+    origin: Coord,
+    destination: Coord,
+    maybe_waypoints: List[Coord]
+) -> List[Coord]:
+    """
+    Build a *full* OSRM polyline going origin → (ordered waypoints) → destination.
+    Uses NN ordering seeded at origin; destination is forced last.
+    """
+    if not maybe_waypoints:
+        return get_route_segment(origin, destination)
+
+    ordered = traveller_salesman(points=maybe_waypoints, start_coord=origin)
+    # ordered includes origin as [0]; ensure destination last
+    ordered.append(destination)
+
+    full: List[Coord] = []
+    for i in range(len(ordered) - 1):
+        seg = get_route_segment(ordered[i], ordered[i + 1])
+        if i > 0:
+            seg = seg[1:]  # avoid duplicating nodes
+        full.extend(seg)
+    return full
+
+# -------- Remaining distance & ETA helpers --------
+
+def remaining_route_distance_km(current: Coord, route_points: List[Coord]) -> float:
+    """
+    Sum distances from 'current' to the end of 'route_points' by:
+      1) snapping to the closest point on the polyline,
+      2) summing the rest of the polyline,
+      3) adding the snap distance from current → snapped point.
     """
     if not route_points:
         return 0.0
 
-    # Find closest point on route to current location
-    closest_idx = min(
-        range(len(route_points)),
-        key=lambda i: haversine_km((current_lat, current_lon), route_points[i])
+    # find closest index on route
+    closest_idx = min(range(len(route_points)), key=lambda i: haversine_km(current, route_points[i]))
+
+    # snap distance
+    dist_km = haversine_km(current, route_points[closest_idx])
+
+    # remaining polyline
+    for i in range(closest_idx, len(route_points) - 1):
+        dist_km += haversine_km(route_points[i], route_points[i + 1])
+
+    return dist_km
+
+def eta_minutes(remaining_km: float, avg_speed_kmh: float = 30.0) -> int:
+    if avg_speed_kmh <= 0:
+        return 0
+    minutes = (remaining_km / avg_speed_kmh) * 60.0
+    return max(0, int(round(minutes)))
+
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+
+r = redis.from_url(REDIS_URL)
+
+def simulate_movement_kafka(package_id: str, packages_col, snapshots_col, sleep_sec: float = 2.0):
+    """
+    Simulate package movement along its route:
+    - Updates Redis
+    - Publishes to Kafka
+    - Stores snapshot in MongoDB
+    """
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode("utf-8")
     )
 
-    # Distance from current location to first route point
-    dist = haversine_km((current_lat, current_lon), route_points[closest_idx])
-
-    # Sum distances along remaining route
-    for i in range(closest_idx, len(route_points)-1):
-        dist += haversine_km(route_points[i], route_points[i+1])
-
-    return dist
-
-
-#  ======= Redis Config=====
-
-import redis, json
-r = redis.Redis(host="localhost", port=6379, db=0)
-
-# ==== Background Package Movement ====
-def simulate_movement(package_id, packages_col):
     pkg = packages_col.find_one({"packageId": package_id})
-    if not pkg:
+    if not pkg or "route" not in pkg:
         return
 
-    for point in pkg["route"]:
-        update = {"packageId": package_id, "currentLocation": point}
-        # Publish to Redis channel
-        r.publish("package_updates", json.dumps(update))
-        time.sleep(5)
-        
-        
-# ==== Subcribe(background task)==== 
-def redis_listener(packages_col):
-    pubsub = r.pubsub()
-    pubsub.subscribe("package_updates")
-    for message in pubsub.listen():
-        if message["type"] == "message":
-            data = json.loads(message["data"])
-            packages_col.update_one(
-                {"packageId": data["packageId"]},
-                {"$set": {"currentLocation": data["currentLocation"]}}
-            )
+    route: List[Coord] = pkg["route"]
 
-import math
+    for lat, lon in route[1:]:
+        ts = int(time.time())
+        payload = {"packageId": package_id, "lat": lat, "lon": lon, "ts": ts}
 
-# ==== Distance (Haversine) ====
-def haversine_km(a,b):
-    R=6371
-    from math import radians,sin,cos,atan2,sqrt
-    lat1,lon1,lat2,lon2=map(radians,[a[0],a[1],b[0],b[1]])
-    dlat=lat2-lat1; dlon=lon2-lon1
-    h=sin(dlat/2)**2+cos(lat1)*cos(lat2)*sin(dlon/2)**2
-    return 2*R*atan2(sqrt(h), sqrt(1-h))
+        # Update Redis hot state
+        r.hset(f"PKG:{package_id}", mapping=payload)
 
-def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius in km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dlon / 2) ** 2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c  # distance in km
+        # Publish to Kafka
+        producer.send("package_updates", payload)
 
-def build_branch_chain(origin, destination, branches_col=None):
-    chain = []
-    visited = set()
-    current = origin
-    current_dist = haversine(current[0], current[1], destination[0], destination[1])
+        # Save snapshot in MongoDB
+        snapshots_col.insert_one(payload)
 
-    while True:
-        branches = list(branches_col.find({}, {"_id": 0}))
-        candidates = [b for b in branches if b['branchId'] not in visited]
+        # Sleep to simulate movement
+        time.sleep(sleep_sec)
 
-        if not candidates:
-            break
-
-        # Find nearest branch
-        nearest = min(candidates, key=lambda b: haversine(current[0], current[1], b['lat'], b['lon']))
-        nearest_dist = haversine(nearest['lat'], nearest['lon'], destination[0], destination[1])
-
-        visited.add(nearest['branchId'])
-
-        # Only add if it brings us closer to the destination
-        if nearest_dist < current_dist:
-            chain.append(nearest)
-            current = (nearest['lat'], nearest['lon'])
-            current_dist = nearest_dist
-        else:
-            break
-
-        # stop if we're already very close (< 20km from destination)
-        if current_dist < 20:
-            break
-
-    return chain
-
-
-def get_nearest_branch(lat, lon, exclude_ids=[],branches_col=None):
-    branches = list(branches_col.find({}, {"_id": 0}))
-    candidates = [b for b in branches if b['branchId'] not in exclude_ids]
-    nearest = min(candidates, key=lambda b: haversine(lat, lon, b['lat'], b['lon']))
-    return nearest
-
-# Kafka producer for movement events
-producer = None
-def get_kafka_producer():
-    global producer
-    if producer is None:
-        from kafka import KafkaProducer
-        producer = KafkaProducer(
-            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
-            value_serializer=lambda v: json.dumps(v).encode("utf-8")
-        )
-    return producer
-
-def haversine_km(a, b):
-    import math
-    (lat1, lon1), (lat2, lon2) = a, b
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    la1 = math.radians(lat1); la2 = math.radians(lat2)
-    h = (math.sin(dlat/2)**2 +
-         math.cos(la1) * math.cos(la2) * math.sin(dlon/2)**2)
-    return 2 * R * math.atan2(math.sqrt(h), math.sqrt(1-h))
-
-
-
-
-def simulate_movement_kafka(package_id: str, packages_col=None,snapshots_col=None):
-    producer = get_kafka_producer()
-    pkg = packages_col.find_one({"packageId": package_id})
-    if not pkg:
-        return
-
-    for lat, lon in pkg["route"]:
-        evt = {
-            "packageId": package_id,
-            "lat": float(lat),
-            "lon": float(lon),
-            "ts": int(time.time())
-        }
-
-        # send to Kafka
-        producer.send("package_updates", evt)
-        producer.flush(0.1)
-
-        # **update Redis** for real-time status
-        r.hset(
-            f"PKG:{package_id}",
-            mapping={"lat": evt["lat"], "lon": evt["lon"], "ts": evt["ts"]}
-        )
-
-        # **also store snapshot** (optional)
-        snapshots_col.insert_one(evt)
-
-        time.sleep(2)  # simulate movement every 2s
-
+    # Mark package as delivered
+    packages_col.update_one({"packageId": package_id}, {"$set": {"status": "delivered"}})
